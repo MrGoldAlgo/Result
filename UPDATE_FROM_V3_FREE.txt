@@ -1,0 +1,29 @@
+MR GOLD V3 FREE -> V3.1 GROWTH CALENDAR UPDATE
+================================================
+
+If your V3 Free website is already deployed, you do NOT need to recreate Supabase, the tracked account, API key, or MT5 Sync EA.
+
+Update only these two files in your GitHub repository:
+
+1. main.py
+2. static/public.html
+
+Recommended: also update README.md / QUICK_START.txt for your records.
+
+Then:
+3. Commit the changes to the same main branch.
+4. Render should redeploy automatically. If Auto-Deploy is off, use Manual Deploy -> Deploy latest commit.
+5. Keep .python-version = 3.13.5 and PYTHON_VERSION=3.13.5 in render.yaml.
+6. No Supabase SQL/schema change is required.
+7. No change to MR_Gold_MT5_Sync_Free_V3.mq5 is required.
+
+After deploy, open your existing public URL, for example:
+https://YOUR-SITE.onrender.com/p/vantage-main
+
+New section: Growth calendar
+- Growth (Day): daily net P/L, Monday-Sunday
+- Growth (Month): monthly net P/L, Jan-Dec
+- Previous/next month and month strip
+- Unique ID / Magic / Symbol filters apply to the calendar
+
+The global 7/30/90/365-day selector does not limit the calendar. The calendar uses the month/year you select so you can browse historical months independently.
