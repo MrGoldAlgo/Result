@@ -18,7 +18,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me-now")
 SITE_TITLE = os.getenv("SITE_TITLE", "Mr Gold Algo Performance")
 REST = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
 
-app = FastAPI(title=SITE_TITLE, version="3.1-free")
+app = FastAPI(title=SITE_TITLE, version="1.33-free")
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 
 
@@ -192,7 +192,7 @@ def public_page(slug: str):
 def health():
     return {
         "ok": True,
-        "version": "3.1-free",
+        "version": "1.33-free",
         "storage": "supabase",
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SECRET_KEY),
         "unique_id_tracking": True,
@@ -426,6 +426,13 @@ def public_summary(
 
     # Filter choices from whole account. This is usually small enough for a personal tracker.
     all_trades = supa_all("trades", {"account_id": f"eq.{acc['id']}", "order": "close_time.desc"})
+    all_time_net = round(sum(float(t.get("net_profit") or 0) for t in all_trades), 2)
+    latest_balance = float(latest.get("balance") or 0) if latest else 0.0
+    estimated_deposit = round(latest_balance - all_time_net, 2) if latest else 0.0
+    # The sync EA sends trading deals and account snapshots, not broker cash-flow deals.
+    # This value is therefore an estimated net funding base: current balance minus all closed-trade P/L.
+    if abs(estimated_deposit) < 1e-9 and latest_balance:
+        estimated_deposit = round(latest_balance, 2)
     login = acc.get("login") or ""
     return {
         "site_title": SITE_TITLE,
@@ -443,6 +450,12 @@ def public_summary(
             "equity": latest.get("equity") if latest else None,
             "floating_profit": latest.get("floating_profit") if latest else None,
             "ts": latest.get("ts") if latest else None,
+        },
+        "equity_curve": {
+            "deposit": estimated_deposit,
+            "current_equity": latest.get("equity") if latest else None,
+            "period_net": stats["net_profit"],
+            "all_time_net": all_time_net,
         },
         "stats": {k: v for k, v in stats.items() if k != "closed_curve"}
         | {"max_equity_dd": round(max_eq_dd, 2), "max_equity_dd_pct": round(max_eq_dd_pct, 2)},
@@ -465,7 +478,7 @@ def _month_shift(year: int, month: int, delta: int) -> tuple[int, int]:
 
 
 def growth_calendar_data(trades: list[dict], selected_month: str) -> dict:
-    """Aggregate closed-trade net P/L for a daily/monthly growth calendar."""
+    """Aggregate closed-trade net P/L, trade count and total lot size for the growth calendar."""
     try:
         selected = datetime.strptime(selected_month, "%Y-%m")
     except ValueError:
@@ -473,7 +486,7 @@ def growth_calendar_data(trades: list[dict], selected_month: str) -> dict:
 
     year, month = selected.year, selected.month
     daily_map: dict[int, dict] = {}
-    monthly_map: dict[int, dict] = {m: {"net": 0.0, "trades": 0} for m in range(1, 13)}
+    monthly_map: dict[int, dict] = {m: {"net": 0.0, "trades": 0, "lots": 0.0} for m in range(1, 13)}
 
     for t in trades:
         raw = str(t.get("close_time") or "")
@@ -482,28 +495,44 @@ def growth_calendar_data(trades: list[dict], selected_month: str) -> dict:
         except Exception:
             continue
         net = float(t.get("net_profit") or 0)
+        lots = float(t.get("volume") or 0)
         if dt.year == year:
             monthly_map[dt.month]["net"] += net
             monthly_map[dt.month]["trades"] += 1
+            monthly_map[dt.month]["lots"] += lots
         if dt.year == year and dt.month == month:
-            bucket = daily_map.setdefault(dt.day, {"net": 0.0, "trades": 0})
+            bucket = daily_map.setdefault(dt.day, {"net": 0.0, "trades": 0, "lots": 0.0})
             bucket["net"] += net
             bucket["trades"] += 1
+            bucket["lots"] += lots
 
     daily = [
-        {"day": day, "date": f"{year:04d}-{month:02d}-{day:02d}", "net": round(v["net"], 2), "trades": v["trades"]}
+        {
+            "day": day,
+            "date": f"{year:04d}-{month:02d}-{day:02d}",
+            "net": round(v["net"], 2),
+            "trades": v["trades"],
+            "lots": round(v["lots"], 2),
+        }
         for day, v in sorted(daily_map.items())
     ]
     monthly = [
-        {"month": f"{year:04d}-{m:02d}", "net": round(monthly_map[m]["net"], 2), "trades": monthly_map[m]["trades"]}
+        {
+            "month": f"{year:04d}-{m:02d}",
+            "net": round(monthly_map[m]["net"], 2),
+            "trades": monthly_map[m]["trades"],
+            "lots": round(monthly_map[m]["lots"], 2),
+        }
         for m in range(1, 13)
     ]
     return {
         "selected_month": f"{year:04d}-{month:02d}",
         "month_net": round(sum(x["net"] for x in daily), 2),
         "month_trades": sum(x["trades"] for x in daily),
+        "month_lots": round(sum(x["lots"] for x in daily), 2),
         "year_net": round(sum(x["net"] for x in monthly), 2),
         "year_trades": sum(x["trades"] for x in monthly),
+        "year_lots": round(sum(x["lots"] for x in monthly), 2),
         "daily": daily,
         "monthly": monthly,
     }
@@ -534,7 +563,7 @@ def public_growth_calendar(
         "account_id": f"eq.{acc['id']}",
         "and": f"(close_time.gte.{start.isoformat()},close_time.lt.{end.isoformat()})",
         "order": "close_time.asc",
-        "select": "close_time,net_profit",
+        "select": "close_time,net_profit,volume",
     }
     if unique_id:
         params["unique_id"] = f"eq.{unique_id}"
