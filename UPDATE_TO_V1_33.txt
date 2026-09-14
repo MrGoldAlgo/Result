@@ -1,0 +1,21 @@
+MR Gold Trading Portal V1.33 — Update from V3.1
+
+Replace these files in your existing GitHub repository:
+1. main.py
+2. static/public.html
+
+Optional cosmetic cleanup:
+3. static/index.html
+4. static/admin.html
+
+No Supabase schema change is required.
+No MT5 Sync EA change is required.
+
+V1.33 changes:
+- Equity curve redesigned to match the supplied reference: cumulative closed-trade P/L, blue above zero and red below zero, 30D/90D/ALL tabs, estimated deposit and current equity.
+- Growth calendar now shows net P/L, percentage change and total lot size for each day and month, plus summary totals.
+- Removed the words Free V3.1 from the public page/header.
+- Public page no longer displays Demo/Live account type text.
+- Existing Unique ID, Magic Number and Symbol filters remain supported.
+
+After committing the files, Render should redeploy automatically.
