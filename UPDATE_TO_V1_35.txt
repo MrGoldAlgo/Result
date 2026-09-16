@@ -1,0 +1,21 @@
+MR GOLD TRADING PORTAL V1.35 - BROKER SERVER TIME FIX
+
+Replace these files in your existing GitHub/Render project:
+1. main.py
+2. static/public.html
+
+Then commit the changes. Render should redeploy automatically.
+
+NO CHANGE REQUIRED:
+- Supabase schema/database
+- Existing account/API key
+- MR_Gold_MT5_Sync_Free_V3.mq5
+
+V1.35 fixes:
+- Recent Closed Trades show MT5 broker server time exactly (no phone/browser timezone conversion).
+- Equity curve x-axis dates use broker trading dates.
+- Equity curve hover date uses broker trading date.
+- Growth Calendar continues to group trades by the same broker trading date.
+
+Example:
+If MT5 History says 15/09/2026 09:06:46, the website will display 15/09/2026, 09:06:46 regardless of the timezone of the device viewing the website.
