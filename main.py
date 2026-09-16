@@ -18,7 +18,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me-now")
 SITE_TITLE = os.getenv("SITE_TITLE", "Mr Gold Algo Performance")
 REST = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
 
-app = FastAPI(title=SITE_TITLE, version="1.33-free")
+app = FastAPI(title=SITE_TITLE, version="1.35-free")
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 
 
@@ -192,7 +192,7 @@ def public_page(slug: str):
 def health():
     return {
         "ok": True,
-        "version": "1.33-free",
+        "version": "1.35-free",
         "storage": "supabase",
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SECRET_KEY),
         "unique_id_tracking": True,
@@ -351,6 +351,50 @@ def trade_stats(trades: list[dict]) -> dict:
     }
 
 
+def gain_metrics(trades: list[dict], base_capital: float) -> dict:
+    """All-time gain percentages for the current UID/Magic/Symbol scope.
+
+    Daily/monthly averages are arithmetic means across active trading days/months
+    (periods containing at least one closed trade), using the same estimated
+    funding base as the growth calendar.
+    """
+    base = abs(float(base_capital or 0))
+    daily: dict[str, float] = {}
+    monthly: dict[str, float] = {}
+    total = 0.0
+    for t in trades:
+        net = float(t.get("net_profit") or 0)
+        total += net
+        try:
+            dt = parse_ts(str(t.get("close_time") or ""))
+        except Exception:
+            continue
+        day_key = dt.strftime("%Y-%m-%d")
+        month_key = dt.strftime("%Y-%m")
+        daily[day_key] = daily.get(day_key, 0.0) + net
+        monthly[month_key] = monthly.get(month_key, 0.0) + net
+
+    if base <= 1e-12:
+        return {
+            "total_gain_pct": 0.0,
+            "avg_daily_gain_pct": 0.0,
+            "avg_monthly_gain_pct": 0.0,
+            "active_days": len(daily),
+            "active_months": len(monthly),
+        }
+
+    total_gain = total / base * 100
+    avg_daily = (sum(v / base * 100 for v in daily.values()) / len(daily)) if daily else 0.0
+    avg_monthly = (sum(v / base * 100 for v in monthly.values()) / len(monthly)) if monthly else 0.0
+    return {
+        "total_gain_pct": round(total_gain, 2),
+        "avg_daily_gain_pct": round(avg_daily, 2),
+        "avg_monthly_gain_pct": round(avg_monthly, 2),
+        "active_days": len(daily),
+        "active_months": len(monthly),
+    }
+
+
 def build_group(rows: list[dict], key_name: str, key_value: str, extra: Optional[dict] = None) -> dict:
     s = trade_stats(rows)
     out = {
@@ -433,6 +477,22 @@ def public_summary(
     # This value is therefore an estimated net funding base: current balance minus all closed-trade P/L.
     if abs(estimated_deposit) < 1e-9 and latest_balance:
         estimated_deposit = round(latest_balance, 2)
+
+    # Gain metrics are all-time for the currently selected UID/Magic/Symbol scope.
+    # The 30D/90D/ALL curve selector does not change these "Total/Average" values.
+    scope_params = {"account_id": f"eq.{acc['id']}", "order": "close_time.asc"}
+    if unique_id:
+        scope_params["unique_id"] = f"eq.{unique_id}"
+    if magic:
+        scope_params["magic"] = f"eq.{magic}"
+    if symbol:
+        scope_params["symbol"] = f"eq.{symbol}"
+    if not unique_id and not magic and not symbol:
+        scope_all_trades = all_trades
+    else:
+        scope_all_trades = supa_all("trades", scope_params)
+    gains = gain_metrics(scope_all_trades, estimated_deposit)
+
     login = acc.get("login") or ""
     return {
         "site_title": SITE_TITLE,
@@ -459,10 +519,12 @@ def public_summary(
         },
         "stats": {k: v for k, v in stats.items() if k != "closed_curve"}
         | {"max_equity_dd": round(max_eq_dd, 2), "max_equity_dd_pct": round(max_eq_dd_pct, 2)},
+        "gain_stats": gains,
         "closed_curve": stats["closed_curve"],
         "snapshot_curve": snap_curve[-2000:],
         "unique_ids": uid_groups,
         "strategies": strategy_groups,
+        "time_basis": "broker_server",
         "filter_state": {"days": days, "unique_id": unique_id, "magic": magic, "symbol": symbol},
         "filters": {
             "unique_ids": sorted(set((t.get("unique_id") or "Unassigned") for t in all_trades)),
