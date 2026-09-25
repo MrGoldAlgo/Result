@@ -18,7 +18,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me-now")
 SITE_TITLE = os.getenv("SITE_TITLE", "Mr Gold Algo Performance")
 REST = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
 
-app = FastAPI(title=SITE_TITLE, version="1.35-free")
+app = FastAPI(title=SITE_TITLE, version="1.36-free")
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 
 
@@ -86,6 +86,18 @@ def supa_insert(table: str, payload, upsert: bool = False) -> list[dict]:
     return r.json() if r.text else []
 
 
+def supa_upsert(table: str, payload, on_conflict: str) -> None:
+    """Batch upsert rows using a named/composite unique constraint."""
+    with httpx.Client(timeout=30.0) as c:
+        r = c.post(
+            f"{REST}/{table}",
+            headers=_headers({"Prefer": "resolution=merge-duplicates,return=minimal"}),
+            params={"on_conflict": on_conflict},
+            json=payload,
+        )
+    _check(r)
+
+
 def supa_patch(table: str, params: dict, payload: dict) -> list[dict]:
     with httpx.Client(timeout=30.0) as c:
         r = c.patch(
@@ -136,6 +148,9 @@ class SnapshotIn(BaseModel):
     margin: float = 0.0
     free_margin: float = 0.0
     floating_profit: float = 0.0
+    net_deposit: Optional[float] = None  # legacy V1.36 compatibility
+    deposit_total: Optional[float] = None
+    withdrawal_total: Optional[float] = None
 
 
 class TradeIn(BaseModel):
@@ -192,7 +207,7 @@ def public_page(slug: str):
 def health():
     return {
         "ok": True,
-        "version": "1.35-free",
+        "version": "1.36-free",
         "storage": "supabase",
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SECRET_KEY),
         "unique_id_tracking": True,
@@ -255,18 +270,22 @@ def sync_snapshot(payload: SnapshotIn, x_api_key: str = Header(default="")):
             "account_type": payload.account_type,
         },
     )
-    supa_insert(
-        "snapshots",
-        {
-            "account_id": acc["id"],
-            "ts": iso(payload.ts),
-            "balance": payload.balance,
-            "equity": payload.equity,
-            "margin": payload.margin,
-            "free_margin": payload.free_margin,
-            "floating_profit": payload.floating_profit,
-        },
-    )
+    snapshot_row = {
+        "account_id": acc["id"],
+        "ts": iso(payload.ts),
+        "balance": payload.balance,
+        "equity": payload.equity,
+        "margin": payload.margin,
+        "free_margin": payload.free_margin,
+        "floating_profit": payload.floating_profit,
+    }
+    if payload.net_deposit is not None:
+        snapshot_row["net_deposit"] = payload.net_deposit
+    if payload.deposit_total is not None:
+        snapshot_row["deposit_total"] = payload.deposit_total
+    if payload.withdrawal_total is not None:
+        snapshot_row["withdrawal_total"] = payload.withdrawal_total
+    supa_insert("snapshots", snapshot_row)
     return {"ok": True}
 
 
@@ -274,53 +293,42 @@ def sync_snapshot(payload: SnapshotIn, x_api_key: str = Header(default="")):
 def sync_trades(payload: TradeBatch, x_api_key: str = Header(default="")):
     acc = account_from_key(x_api_key)
     if not payload.trades:
-        return {"ok": True, "inserted": 0, "updated": 0, "skipped": 0}
+        return {"ok": True, "upserted": 0}
 
     tickets = [str(t.deal_ticket) for t in payload.trades]
-    # MT5 deal tickets are numeric, which makes this PostgREST IN filter safe/simple.
     in_value = "in.(" + ",".join(tickets) + ")"
     existing_rows = supa_get(
         "trades",
         {
             "account_id": f"eq.{acc['id']}",
             "deal_ticket": in_value,
-            "select": "id,deal_ticket,unique_id,strategy",
+            "select": "deal_ticket,unique_id,strategy",
         },
     )
     existing = {str(r["deal_ticket"]): r for r in existing_rows}
-    inserts = []
-    inserted = updated = skipped = 0
+    rows = []
 
     for t in payload.trades:
         d = t.model_dump()
         ticket = str(d["deal_ticket"])
         d["unique_id"] = (d.get("unique_id") or "Unassigned").strip()[:80] or "Unassigned"
+        old = existing.get(ticket)
+        if old:
+            if d["unique_id"] == "Unassigned" and old.get("unique_id") not in (None, "", "Unassigned"):
+                d["unique_id"] = old["unique_id"]
+            if (not d.get("strategy") or str(d.get("strategy", "")).startswith("Unlabelled")) and old.get("strategy"):
+                d["strategy"] = old["strategy"]
         if d["net_profit"] is None:
             d["net_profit"] = d["profit"] + d["commission"] + d["swap"] + d["fee"]
         d["account_id"] = acc["id"]
         d["open_time"] = iso(d["open_time"])
         d["close_time"] = iso(d["close_time"])
+        rows.append(d)
 
-        old = existing.get(ticket)
-        if old:
-            patch = {}
-            if (old.get("unique_id") in (None, "", "Unassigned")) and d["unique_id"] != "Unassigned":
-                patch["unique_id"] = d["unique_id"]
-            if (old.get("strategy") in (None, "", "Unlabelled") or str(old.get("strategy", "")).startswith("Unlabelled")) and d["strategy"]:
-                patch["strategy"] = d["strategy"]
-            if patch:
-                supa_patch("trades", {"id": f"eq.{old['id']}"}, patch)
-                updated += 1
-            else:
-                skipped += 1
-            continue
-        inserts.append(d)
-        inserted += 1
-
-    if inserts:
-        supa_insert("trades", inserts)
-    return {"ok": True, "inserted": inserted, "updated": updated, "skipped": skipped}
-
+    # Upsert, rather than ignore duplicate tickets. This lets V1.36 backfill
+    # historical trades with corrected two-sided commission on the first resync.
+    supa_upsert("trades", rows, "account_id,deal_ticket")
+    return {"ok": True, "upserted": len(rows)}
 
 def trade_stats(trades: list[dict]) -> dict:
     vals = [float(t.get("net_profit") or 0) for t in trades]
@@ -352,11 +360,11 @@ def trade_stats(trades: list[dict]) -> dict:
 
 
 def gain_metrics(trades: list[dict], base_capital: float) -> dict:
-    """All-time gain percentages for the current UID/Magic/Symbol scope.
+    """Gain percentages for the currently selected date/UID/Magic/Symbol scope.
 
     Daily/monthly averages are arithmetic means across active trading days/months
-    (periods containing at least one closed trade), using the same estimated
-    funding base as the growth calendar.
+    (periods containing at least one closed trade), using total positive MT5
+    balance deposits as the funding base when V1.36 Rev1 snapshots are available.
     """
     base = abs(float(base_capital or 0))
     daily: dict[str, float] = {}
@@ -412,19 +420,57 @@ def build_group(rows: list[dict], key_name: str, key_value: str, extra: Optional
     return out
 
 
+def _custom_bounds(from_date: str = "", to_date: str = "") -> tuple[Optional[datetime], Optional[datetime]]:
+    start = end = None
+    if from_date:
+        try:
+            start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(422, "from_date must be YYYY-MM-DD")
+    if to_date:
+        try:
+            end = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+        except ValueError:
+            raise HTTPException(422, "to_date must be YYYY-MM-DD")
+    if start and end and start >= end:
+        raise HTTPException(422, "from_date must be on or before to_date")
+    return start, end
+
+
+def _apply_period(params: dict, field: str, days: int = 0, from_date: str = "", to_date: str = "") -> tuple[Optional[datetime], Optional[datetime]]:
+    """Apply an inclusive broker-date range. Custom dates override rolling days."""
+    start, end = _custom_bounds(from_date, to_date)
+    clauses = []
+    if start or end:
+        if start:
+            clauses.append(f"{field}.gte.{start.isoformat()}")
+        if end:
+            clauses.append(f"{field}.lt.{end.isoformat()}")
+    elif days:
+        start = datetime.now(timezone.utc) - timedelta(days=days)
+        clauses.append(f"{field}.gte.{start.isoformat()}")
+    if clauses:
+        if len(clauses) == 1:
+            op_value = clauses[0].split(f"{field}.", 1)[1]
+            params[field] = op_value
+        else:
+            params["and"] = "(" + ",".join(clauses) + ")"
+    return start, end
+
+
 @app.get("/api/v1/public/{slug}/summary")
 def public_summary(
     slug: str,
     days: int = Query(0, ge=0, le=3650),
+    from_date: str = "",
+    to_date: str = "",
     unique_id: str = "",
     magic: str = "",
     symbol: str = "",
 ):
     acc = get_acc_by_slug(slug)
     params = {"account_id": f"eq.{acc['id']}", "order": "close_time.asc"}
-    if days:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        params["close_time"] = f"gte.{cutoff.isoformat()}"
+    _apply_period(params, "close_time", days, from_date, to_date)
     if unique_id:
         params["unique_id"] = f"eq.{unique_id}"
     if magic:
@@ -435,10 +481,8 @@ def public_summary(
     stats = trade_stats(trades)
 
     snap_params = {"account_id": f"eq.{acc['id']}", "order": "ts.asc"}
-    if days:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        snap_params["ts"] = f"gte.{cutoff.isoformat()}"
-    snaps = supa_all("snapshots", snap_params, max_rows=50000)
+    _apply_period(snap_params, "ts", days, from_date, to_date)
+    snaps = supa_all("snapshots", snap_params, max_rows=250000)
     latest_rows = supa_get("snapshots", {"account_id": f"eq.{acc['id']}", "order": "ts.desc"}, limit=1)
     latest = latest_rows[0] if latest_rows else None
 
@@ -472,26 +516,29 @@ def public_summary(
     all_trades = supa_all("trades", {"account_id": f"eq.{acc['id']}", "order": "close_time.desc"})
     all_time_net = round(sum(float(t.get("net_profit") or 0) for t in all_trades), 2)
     latest_balance = float(latest.get("balance") or 0) if latest else 0.0
-    estimated_deposit = round(latest_balance - all_time_net, 2) if latest else 0.0
-    # The sync EA sends trading deals and account snapshots, not broker cash-flow deals.
-    # This value is therefore an estimated net funding base: current balance minus all closed-trade P/L.
-    if abs(estimated_deposit) < 1e-9 and latest_balance:
-        estimated_deposit = round(latest_balance, 2)
-
-    # Gain metrics are all-time for the currently selected UID/Magic/Symbol scope.
-    # The 30D/90D/ALL curve selector does not change these "Total/Average" values.
-    scope_params = {"account_id": f"eq.{acc['id']}", "order": "close_time.asc"}
-    if unique_id:
-        scope_params["unique_id"] = f"eq.{unique_id}"
-    if magic:
-        scope_params["magic"] = f"eq.{magic}"
-    if symbol:
-        scope_params["symbol"] = f"eq.{symbol}"
-    if not unique_id and not magic and not symbol:
-        scope_all_trades = all_trades
+    synced_deposit_total = latest.get("deposit_total") if latest else None
+    synced_withdrawal_total = latest.get("withdrawal_total") if latest else None
+    synced_net_deposit = latest.get("net_deposit") if latest else None
+    if synced_deposit_total is not None:
+        deposit_total = round(float(synced_deposit_total), 2)
+        withdrawal_total = round(float(synced_withdrawal_total or 0), 2)
+        deposit_source = "mt5_balance_transactions_split"
+    elif synced_net_deposit is not None:
+        # Backward compatibility with the first V1.36 Sync EA.
+        deposit_total = round(float(synced_net_deposit), 2)
+        withdrawal_total = 0.0
+        deposit_source = "legacy_v1_36_net_deposit"
     else:
-        scope_all_trades = supa_all("trades", scope_params)
-    gains = gain_metrics(scope_all_trades, estimated_deposit)
+        # Legacy fallback until the revised V1.36 Sync EA has sent a snapshot.
+        deposit_total = round(latest_balance - all_time_net, 2) if latest else 0.0
+        withdrawal_total = 0.0
+        deposit_source = "legacy_estimate"
+        if abs(deposit_total) < 1e-9 and latest_balance:
+            deposit_total = round(latest_balance, 2)
+
+    # Gain metrics use deposits only as the funding base; withdrawals are displayed
+    # separately and are not subtracted from Deposit.
+    gains = gain_metrics(trades, deposit_total)
 
     login = acc.get("login") or ""
     return {
@@ -512,7 +559,9 @@ def public_summary(
             "ts": latest.get("ts") if latest else None,
         },
         "equity_curve": {
-            "deposit": estimated_deposit,
+            "deposit": deposit_total,
+            "withdrawal": withdrawal_total,
+            "deposit_source": deposit_source,
             "current_equity": latest.get("equity") if latest else None,
             "period_net": stats["net_profit"],
             "all_time_net": all_time_net,
@@ -525,7 +574,7 @@ def public_summary(
         "unique_ids": uid_groups,
         "strategies": strategy_groups,
         "time_basis": "broker_server",
-        "filter_state": {"days": days, "unique_id": unique_id, "magic": magic, "symbol": symbol},
+        "filter_state": {"days": days, "from_date": from_date, "to_date": to_date, "unique_id": unique_id, "magic": magic, "symbol": symbol},
         "filters": {
             "unique_ids": sorted(set((t.get("unique_id") or "Unassigned") for t in all_trades)),
             "magics": sorted(set(str(t.get("magic") or "0") for t in all_trades)),
@@ -604,6 +653,8 @@ def growth_calendar_data(trades: list[dict], selected_month: str) -> dict:
 def public_growth_calendar(
     slug: str,
     month: str = "",
+    from_date: str = "",
+    to_date: str = "",
     unique_id: str = "",
     magic: str = "",
     symbol: str = "",
@@ -621,9 +672,15 @@ def public_growth_calendar(
     # are intentionally shared with the rest of the public dashboard.
     start = datetime(selected.year, 1, 1, tzinfo=timezone.utc)
     end = datetime(selected.year + 1, 1, 1, tzinfo=timezone.utc)
+    range_start, range_end = _custom_bounds(from_date, to_date)
+    clauses = [f"close_time.gte.{start.isoformat()}", f"close_time.lt.{end.isoformat()}"]
+    if range_start:
+        clauses.append(f"close_time.gte.{range_start.isoformat()}")
+    if range_end:
+        clauses.append(f"close_time.lt.{range_end.isoformat()}")
     params = {
         "account_id": f"eq.{acc['id']}",
-        "and": f"(close_time.gte.{start.isoformat()},close_time.lt.{end.isoformat()})",
+        "and": "(" + ",".join(clauses) + ")",
         "order": "close_time.asc",
         "select": "close_time,net_profit,volume",
     }
@@ -650,15 +707,15 @@ def public_trades(
     slug: str,
     limit: int = Query(200, ge=1, le=2000),
     days: int = Query(0, ge=0, le=3650),
+    from_date: str = "",
+    to_date: str = "",
     unique_id: str = "",
     magic: str = "",
     symbol: str = "",
 ):
     acc = get_acc_by_slug(slug)
     params = {"account_id": f"eq.{acc['id']}", "order": "close_time.desc"}
-    if days:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        params["close_time"] = f"gte.{cutoff.isoformat()}"
+    _apply_period(params, "close_time", days, from_date, to_date)
     if unique_id:
         params["unique_id"] = f"eq.{unique_id}"
     if magic:
