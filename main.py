@@ -162,7 +162,7 @@ class SnapshotIn(BaseModel):
     margin: float = 0.0
     free_margin: float = 0.0
     floating_profit: float = 0.0
-    net_deposit: Optional[float] = None  # legacy V1.36 compatibility
+    net_deposit: Optional[float] = None  # accepted from legacy clients, intentionally ignored
     deposit_total: Optional[float] = None
     withdrawal_total: Optional[float] = None
 
@@ -295,8 +295,6 @@ def sync_snapshot(payload: SnapshotIn, x_api_key: str = Header(default="")):
         "free_margin": payload.free_margin,
         "floating_profit": payload.floating_profit,
     }
-    if payload.net_deposit is not None:
-        snapshot_row["net_deposit"] = payload.net_deposit
     if payload.deposit_total is not None:
         snapshot_row["deposit_total"] = payload.deposit_total
     if payload.withdrawal_total is not None:
@@ -690,7 +688,7 @@ def public_summary(
         {
             "account_id": f"eq.{acc['id']}",
             "order": "ts.desc",
-            "select": "ts,balance,equity,floating_profit,net_deposit,deposit_total,withdrawal_total",
+            "select": "ts,balance,equity,floating_profit,deposit_total,withdrawal_total",
         },
         limit=1,
     )
@@ -702,15 +700,10 @@ def public_summary(
     latest_balance = float(latest.get("balance") or 0) if latest else 0.0
     synced_deposit_total = latest.get("deposit_total") if latest else None
     synced_withdrawal_total = latest.get("withdrawal_total") if latest else None
-    synced_net_deposit = latest.get("net_deposit") if latest else None
     if synced_deposit_total is not None:
         deposit_total = round(float(synced_deposit_total), 2)
         withdrawal_total = round(float(synced_withdrawal_total or 0), 2)
         deposit_source = "mt5_balance_transactions_split"
-    elif synced_net_deposit is not None:
-        deposit_total = round(float(synced_net_deposit), 2)
-        withdrawal_total = 0.0
-        deposit_source = "legacy_v1_36_net_deposit"
     else:
         deposit_total = round(latest_balance - all_time_net, 2) if latest else 0.0
         withdrawal_total = 0.0
