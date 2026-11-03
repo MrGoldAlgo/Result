@@ -1,6 +1,7 @@
 import hashlib
 import os
 import secrets
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -17,8 +18,10 @@ SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "") or os.getenv("SUPABAS
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me-now")
 SITE_TITLE = os.getenv("SITE_TITLE", "Mr Gold Algo Performance")
 REST = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
+_META_CACHE: dict[int, tuple[float, dict]] = {}
+_META_CACHE_TTL = 300.0
 
-app = FastAPI(title=SITE_TITLE, version="1.36-free")
+app = FastAPI(title=SITE_TITLE, version="1.37")
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 
 
@@ -55,26 +58,37 @@ def supa_get(table: str, params: Optional[dict] = None, limit: Optional[int] = N
     return r.json()
 
 
-def supa_all(table: str, params: Optional[dict] = None, chunk: int = 1000, max_rows: int = 100000) -> list[dict]:
-    """Fetch all PostgREST rows in pages (Supabase commonly caps one response)."""
-    out: list[dict] = []
+def supa_iter(table: str, params: Optional[dict] = None, chunk: int = 2000, max_rows: int = 1000000):
+    """Stream PostgREST rows page-by-page so Render never holds a huge result set in RAM."""
+    q = {"select": "*", **(params or {})}
     start = 0
-    while start < max_rows:
-        end = min(start + chunk - 1, max_rows - 1)
-        with httpx.Client(timeout=30.0) as c:
+    with httpx.Client(timeout=30.0) as c:
+        while start < max_rows:
+            end = min(start + chunk - 1, max_rows - 1)
             r = c.get(
                 f"{REST}/{table}",
                 headers=_headers({"Range": f"{start}-{end}"}),
-                params={"select": "*", **(params or {})},
+                params=q,
             )
-        _check(r)
-        rows = r.json()
-        out.extend(rows)
-        if len(rows) < chunk:
-            break
-        start += chunk
-    return out
+            _check(r)
+            rows = r.json()
+            for row in rows:
+                yield row
+            if len(rows) < chunk:
+                break
+            start += chunk
 
+
+def supa_rpc(function_name: str, payload: Optional[dict] = None):
+    """Call a small server-side Postgres function through Supabase RPC."""
+    with httpx.Client(timeout=30.0) as c:
+        r = c.post(
+            f"{REST}/rpc/{function_name}",
+            headers=_headers(),
+            json=payload or {},
+        )
+    _check(r)
+    return r.json() if r.text else None
 
 def supa_insert(table: str, payload, upsert: bool = False) -> list[dict]:
     prefer = "return=representation"
@@ -207,10 +221,12 @@ def public_page(slug: str):
 def health():
     return {
         "ok": True,
-        "version": "1.36-free",
+        "version": "1.37",
         "storage": "supabase",
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SECRET_KEY),
         "unique_id_tracking": True,
+        "optimized_loading": True,
+        "equity_dd": "postgres_rpc",
     }
 
 
@@ -328,6 +344,7 @@ def sync_trades(payload: TradeBatch, x_api_key: str = Header(default="")):
     # Upsert, rather than ignore duplicate tickets. This lets V1.36 backfill
     # historical trades with corrected two-sided commission on the first resync.
     supa_upsert("trades", rows, "account_id,deal_ticket")
+    _META_CACHE.pop(int(acc["id"]), None)
     return {"ok": True, "upserted": len(rows)}
 
 def trade_stats(trades: list[dict]) -> dict:
@@ -420,6 +437,204 @@ def build_group(rows: list[dict], key_name: str, key_value: str, extra: Optional
     return out
 
 
+
+def _stat_state() -> dict:
+    return {
+        "wins": 0,
+        "losses": 0,
+        "gross_profit": 0.0,
+        "gross_loss_abs": 0.0,
+        "net": 0.0,
+        "count": 0,
+        "running": 0.0,
+        "peak": 0.0,
+        "maxdd": 0.0,
+        "maxdd_pct": 0.0,
+    }
+
+
+def _stat_add(state: dict, net: float) -> None:
+    net = float(net or 0.0)
+    state["count"] += 1
+    state["net"] += net
+    if net > 0:
+        state["wins"] += 1
+        state["gross_profit"] += net
+    elif net < 0:
+        state["losses"] += 1
+        state["gross_loss_abs"] += abs(net)
+
+    state["running"] += net
+    if state["running"] > state["peak"]:
+        state["peak"] = state["running"]
+    dd = state["peak"] - state["running"]
+    if dd > state["maxdd"]:
+        state["maxdd"] = dd
+    if state["peak"] > 0:
+        pct = dd / state["peak"] * 100.0
+        if pct > state["maxdd_pct"]:
+            state["maxdd_pct"] = pct
+
+
+def _stat_result(state: dict) -> dict:
+    count = int(state["count"])
+    gp = float(state["gross_profit"])
+    gl = float(state["gross_loss_abs"])
+    net = float(state["net"])
+    return {
+        "net_profit": round(net, 2),
+        "win_rate": round(state["wins"] / count * 100.0, 2) if count else 0.0,
+        "profit_factor": round(gp / gl, 2) if gl else (999 if gp else 0),
+        "max_closed_dd": round(float(state["maxdd"]), 2),
+        "max_closed_dd_pct": round(float(state["maxdd_pct"]), 2),
+        "total_trades": count,
+        "avg_trade": round(net / count, 2) if count else 0.0,
+        "gross_profit": round(gp, 2),
+        "gross_loss": round(-gl, 2),
+    }
+
+
+def _compact_curve(points: list[dict], max_points: int = 1200) -> list[dict]:
+    """Adaptive downsampling: keep the chart compact even for very long histories."""
+    if len(points) <= max_points * 2:
+        return points
+    last = points[-1]
+    compacted = points[::2]
+    if compacted[-1] is not last:
+        compacted.append(last)
+    return compacted
+
+
+def _gain_result(daily: dict[str, float], monthly: dict[str, float], total: float, base_capital: float) -> dict:
+    base = abs(float(base_capital or 0))
+    if base <= 1e-12:
+        return {
+            "total_gain_pct": 0.0,
+            "avg_daily_gain_pct": 0.0,
+            "avg_monthly_gain_pct": 0.0,
+            "active_days": len(daily),
+            "active_months": len(monthly),
+        }
+    return {
+        "total_gain_pct": round(total / base * 100.0, 2),
+        "avg_daily_gain_pct": round(sum(v / base * 100.0 for v in daily.values()) / len(daily), 2) if daily else 0.0,
+        "avg_monthly_gain_pct": round(sum(v / base * 100.0 for v in monthly.values()) / len(monthly), 2) if monthly else 0.0,
+        "active_days": len(daily),
+        "active_months": len(monthly),
+    }
+
+
+def _period_trade_aggregate(params: dict, base_capital: float) -> dict:
+    """Aggregate period trades while streaming rows from Supabase.
+
+    Only five narrow columns are fetched. Raw rows are discarded immediately,
+    so memory use stays nearly flat even if the account history becomes large.
+    """
+    q = dict(params)
+    q["select"] = "close_time,net_profit,unique_id,strategy,magic"
+    q["order"] = "close_time.asc"
+
+    overall = _stat_state()
+    uid_states: dict[str, dict] = {}
+    strategy_states: dict[tuple[str, str, str], dict] = {}
+    daily: dict[str, float] = {}
+    monthly: dict[str, float] = {}
+    curve: list[dict] = []
+
+    for t in supa_iter("trades", q, chunk=2500, max_rows=1000000):
+        net = float(t.get("net_profit") or 0)
+        _stat_add(overall, net)
+
+        uid = (t.get("unique_id") or "Unassigned").strip() or "Unassigned"
+        strategy = t.get("strategy") or f"Magic {t.get('magic') or '0'}"
+        magic = str(t.get("magic") or "0")
+
+        us = uid_states.setdefault(uid, _stat_state())
+        _stat_add(us, net)
+        ss = strategy_states.setdefault((uid, strategy, magic), _stat_state())
+        _stat_add(ss, net)
+
+        raw = str(t.get("close_time") or "")
+        try:
+            dt = parse_ts(raw)
+            day_key = dt.strftime("%Y-%m-%d")
+            month_key = dt.strftime("%Y-%m")
+            daily[day_key] = daily.get(day_key, 0.0) + net
+            monthly[month_key] = monthly.get(month_key, 0.0) + net
+        except Exception:
+            pass
+
+        curve.append({"ts": raw, "value": round(float(overall["running"]), 2)})
+        curve = _compact_curve(curve)
+
+    stats = _stat_result(overall)
+    uid_groups = []
+    for uid, state in uid_states.items():
+        s = _stat_result(state)
+        uid_groups.append({
+            "unique_id": uid,
+            "trades": s["total_trades"],
+            "net": s["net_profit"],
+            "win_rate": s["win_rate"],
+            "profit_factor": s["profit_factor"],
+            "max_closed_dd": s["max_closed_dd"],
+            "max_closed_dd_pct": s["max_closed_dd_pct"],
+            "avg_trade": s["avg_trade"],
+        })
+    uid_groups.sort(key=lambda x: x["net"], reverse=True)
+
+    strategy_groups = []
+    for (uid, strategy, magic), state in strategy_states.items():
+        s = _stat_result(state)
+        strategy_groups.append({
+            "strategy": strategy,
+            "unique_id": uid,
+            "magic": magic,
+            "trades": s["total_trades"],
+            "net": s["net_profit"],
+            "win_rate": s["win_rate"],
+            "profit_factor": s["profit_factor"],
+            "max_closed_dd": s["max_closed_dd"],
+            "max_closed_dd_pct": s["max_closed_dd_pct"],
+            "avg_trade": s["avg_trade"],
+        })
+    strategy_groups.sort(key=lambda x: x["net"], reverse=True)
+
+    return {
+        "stats": stats,
+        "closed_curve": curve,
+        "unique_ids": uid_groups,
+        "strategies": strategy_groups,
+        "gain_stats": _gain_result(daily, monthly, float(overall["net"]), base_capital),
+    }
+
+
+def _account_meta(account_id: int) -> dict:
+    """Compact all-time metadata calculated inside PostgreSQL, cached briefly."""
+    cached = _META_CACHE.get(account_id)
+    now = time.monotonic()
+    if cached and now - cached[0] < _META_CACHE_TTL:
+        return cached[1]
+    result = supa_rpc("mg_account_meta_v137", {"p_account_id": account_id})
+    row = (result[0] if result else {}) if isinstance(result, list) else (result or {})
+    _META_CACHE[account_id] = (now, row)
+    return row
+
+
+def _equity_dd(account_id: int, start: Optional[datetime], end: Optional[datetime]) -> tuple[float, float]:
+    """Exact peak-to-trough equity DD calculated inside PostgreSQL, not in Render RAM."""
+    result = supa_rpc(
+        "mg_equity_dd_v137",
+        {
+            "p_account_id": account_id,
+            "p_start": start.isoformat() if start else None,
+            "p_end": end.isoformat() if end else None,
+        },
+    )
+    row = result[0] if isinstance(result, list) and result else (result or {})
+    return float(row.get("max_equity_dd") or 0), float(row.get("max_equity_dd_pct") or 0)
+
+
 def _custom_bounds(from_date: str = "", to_date: str = "") -> tuple[Optional[datetime], Optional[datetime]]:
     start = end = None
     if from_date:
@@ -469,52 +684,21 @@ def public_summary(
     symbol: str = "",
 ):
     acc = get_acc_by_slug(slug)
-    params = {"account_id": f"eq.{acc['id']}", "order": "close_time.asc"}
-    _apply_period(params, "close_time", days, from_date, to_date)
-    if unique_id:
-        params["unique_id"] = f"eq.{unique_id}"
-    if magic:
-        params["magic"] = f"eq.{magic}"
-    if symbol:
-        params["symbol"] = f"eq.{symbol}"
-    trades = supa_all("trades", params)
-    stats = trade_stats(trades)
 
-    snap_params = {"account_id": f"eq.{acc['id']}", "order": "ts.asc"}
-    _apply_period(snap_params, "ts", days, from_date, to_date)
-    snaps = supa_all("snapshots", snap_params, max_rows=250000)
-    latest_rows = supa_get("snapshots", {"account_id": f"eq.{acc['id']}", "order": "ts.desc"}, limit=1)
+    latest_rows = supa_get(
+        "snapshots",
+        {
+            "account_id": f"eq.{acc['id']}",
+            "order": "ts.desc",
+            "select": "ts,balance,equity,floating_profit,net_deposit,deposit_total,withdrawal_total",
+        },
+        limit=1,
+    )
     latest = latest_rows[0] if latest_rows else None
 
-    eq_peak = max_eq_dd = max_eq_dd_pct = 0.0
-    snap_curve = []
-    for s in snaps:
-        eq = float(s.get("equity") or 0)
-        eq_peak = max(eq_peak, eq)
-        dd = eq_peak - eq
-        max_eq_dd = max(max_eq_dd, dd)
-        if eq_peak > 0:
-            max_eq_dd_pct = max(max_eq_dd_pct, dd / eq_peak * 100)
-        snap_curve.append({"ts": s["ts"], "balance": s["balance"], "equity": s["equity"]})
+    meta = _account_meta(int(acc["id"]))
+    all_time_net = round(float(meta.get("all_time_net") or 0), 2)
 
-    uid_buckets: dict[str, list] = {}
-    strategy_buckets: dict[tuple, list] = {}
-    for t in trades:
-        uid = t.get("unique_id") or "Unassigned"
-        uid_buckets.setdefault(uid, []).append(t)
-        skey = (uid, t.get("strategy") or f"Magic {t.get('magic')}", t.get("magic") or "0")
-        strategy_buckets.setdefault(skey, []).append(t)
-    uid_groups = [build_group(rows, "unique_id", uid) for uid, rows in uid_buckets.items()]
-    uid_groups.sort(key=lambda x: x["net"], reverse=True)
-    strategy_groups = [
-        build_group(rows, "strategy", strategy, {"unique_id": uid, "magic": mg})
-        for (uid, strategy, mg), rows in strategy_buckets.items()
-    ]
-    strategy_groups.sort(key=lambda x: x["net"], reverse=True)
-
-    # Filter choices from whole account. This is usually small enough for a personal tracker.
-    all_trades = supa_all("trades", {"account_id": f"eq.{acc['id']}", "order": "close_time.desc"})
-    all_time_net = round(sum(float(t.get("net_profit") or 0) for t in all_trades), 2)
     latest_balance = float(latest.get("balance") or 0) if latest else 0.0
     synced_deposit_total = latest.get("deposit_total") if latest else None
     synced_withdrawal_total = latest.get("withdrawal_total") if latest else None
@@ -524,21 +708,28 @@ def public_summary(
         withdrawal_total = round(float(synced_withdrawal_total or 0), 2)
         deposit_source = "mt5_balance_transactions_split"
     elif synced_net_deposit is not None:
-        # Backward compatibility with the first V1.36 Sync EA.
         deposit_total = round(float(synced_net_deposit), 2)
         withdrawal_total = 0.0
         deposit_source = "legacy_v1_36_net_deposit"
     else:
-        # Legacy fallback until the revised V1.36 Sync EA has sent a snapshot.
         deposit_total = round(latest_balance - all_time_net, 2) if latest else 0.0
         withdrawal_total = 0.0
         deposit_source = "legacy_estimate"
         if abs(deposit_total) < 1e-9 and latest_balance:
             deposit_total = round(latest_balance, 2)
 
-    # Gain metrics use deposits only as the funding base; withdrawals are displayed
-    # separately and are not subtracted from Deposit.
-    gains = gain_metrics(trades, deposit_total)
+    params = {"account_id": f"eq.{acc['id']}"}
+    period_start, period_end = _apply_period(params, "close_time", days, from_date, to_date)
+    if unique_id:
+        params["unique_id"] = f"eq.{unique_id}"
+    if magic:
+        params["magic"] = f"eq.{magic}"
+    if symbol:
+        params["symbol"] = f"eq.{symbol}"
+
+    agg = _period_trade_aggregate(params, deposit_total)
+    stats = agg["stats"]
+    max_eq_dd, max_eq_dd_pct = _equity_dd(int(acc["id"]), period_start, period_end)
 
     login = acc.get("login") or ""
     return {
@@ -566,19 +757,30 @@ def public_summary(
             "period_net": stats["net_profit"],
             "all_time_net": all_time_net,
         },
-        "stats": {k: v for k, v in stats.items() if k != "closed_curve"}
+        "stats": stats
         | {"max_equity_dd": round(max_eq_dd, 2), "max_equity_dd_pct": round(max_eq_dd_pct, 2)},
-        "gain_stats": gains,
-        "closed_curve": stats["closed_curve"],
-        "snapshot_curve": snap_curve[-2000:],
-        "unique_ids": uid_groups,
-        "strategies": strategy_groups,
+        "gain_stats": agg["gain_stats"],
+        "closed_curve": agg["closed_curve"],
+        "unique_ids": agg["unique_ids"],
+        "strategies": agg["strategies"],
         "time_basis": "broker_server",
-        "filter_state": {"days": days, "from_date": from_date, "to_date": to_date, "unique_id": unique_id, "magic": magic, "symbol": symbol},
+        "optimization": {
+            "version": "1.37",
+            "raw_snapshots_loaded_by_render": 0,
+            "closed_curve_max_points": 2400,
+        },
+        "filter_state": {
+            "days": days,
+            "from_date": from_date,
+            "to_date": to_date,
+            "unique_id": unique_id,
+            "magic": magic,
+            "symbol": symbol,
+        },
         "filters": {
-            "unique_ids": sorted(set((t.get("unique_id") or "Unassigned") for t in all_trades)),
-            "magics": sorted(set(str(t.get("magic") or "0") for t in all_trades)),
-            "symbols": sorted(set(t.get("symbol") or "" for t in all_trades if t.get("symbol"))),
+            "unique_ids": meta.get("unique_ids") or [],
+            "magics": meta.get("magics") or [],
+            "symbols": meta.get("symbols") or [],
         },
     }
 
@@ -690,8 +892,8 @@ def public_growth_calendar(
         params["magic"] = f"eq.{magic}"
     if symbol:
         params["symbol"] = f"eq.{symbol}"
-    trades = supa_all("trades", params, max_rows=100000)
-    data = growth_calendar_data(trades, month)
+    params["select"] = "close_time,net_profit,volume"
+    data = growth_calendar_data(supa_iter("trades", params, chunk=2500, max_rows=1000000), month)
 
     # Month-strip navigation: six months before and after the selection.
     strip = []
